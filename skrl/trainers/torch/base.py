@@ -10,6 +10,7 @@ from skrl import config, logger
 from skrl.agents.torch import Agent
 from skrl.envs.wrappers.torch import Wrapper
 
+from omni.isaac.lab_tasks.utils.nets.config_adversary import LinearNetwork
 
 def generate_equally_spaced_scopes(num_envs: int, num_simultaneous_agents: int) -> List[int]:
     """Generate a list of equally spaced scopes for the agents
@@ -71,6 +72,11 @@ class Trainer:
         # setup agents
         self.num_simultaneous_agents = 0
         self._setup_agents()
+
+        # setup adversary
+        num_inputs = 12 # arbitrary number of inputs
+        num_clutter_objects = self.cfg["num_clutter_objects"]
+        self.adversary = LinearNetwork(num_inputs, 64, 64, num_clutter_objects)
 
         # register environment closing if configured
         if self.close_environment_at_exit:
@@ -179,6 +185,8 @@ class Trainer:
         assert self.env.num_agents == 1, "This method is not allowed for multi-agents"
 
         # reset env
+        for i in range(self.env.num_envs):
+            self.env._env.adversary_action[i] =  self.adversary.sample()
         states, infos = self.env.reset()
 
         for timestep in tqdm.tqdm(
@@ -222,14 +230,14 @@ class Trainer:
             self.agents.post_interaction(timestep=timestep, timesteps=self.timesteps)
 
             # reset environments
-            if self.env.num_envs > 1:
-                states = next_states
-            else:
-                if terminated.any() or truncated.any():
-                    with torch.no_grad():
-                        states, infos = self.env.reset()
-                else:
-                    states = next_states
+            states = next_states
+            if timestep == 0 or terminated.any() or truncated.any():
+                with torch.no_grad():
+                    # loop through all envs that need to be reset and update their adversary action
+                    reset_env_ids = self.env.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+                    for i in reset_env_ids:
+                        self.env._env.adversary_action[i] = self.adversary.sample()
+                        
 
     def single_agent_eval(self) -> None:
         """Evaluate agent
