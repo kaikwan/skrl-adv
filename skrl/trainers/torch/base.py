@@ -10,7 +10,7 @@ from skrl import config, logger
 from skrl.agents.torch import Agent
 from skrl.envs.wrappers.torch import Wrapper
 
-from omni.isaac.lab_tasks.utils.nets.config_adversary import LinearNetwork
+from skrl.utils.nets.config_adversary import LinearNetwork
 
 def generate_equally_spaced_scopes(num_envs: int, num_simultaneous_agents: int) -> List[int]:
     """Generate a list of equally spaced scopes for the agents
