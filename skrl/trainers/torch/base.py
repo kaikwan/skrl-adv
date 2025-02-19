@@ -5,12 +5,56 @@ import sys
 import tqdm
 
 import torch
+import torch.nn as nn
 
 from skrl import config, logger
 from skrl.agents.torch import Agent
 from skrl.envs.wrappers.torch import Wrapper
+from skrl.agents.torch.ppo import PPO
+from skrl.models.torch import Model, GaussianMixin, DeterministicMixin
 
 from omni.isaac.lab_tasks.utils.nets.config_adversary import LinearNetwork
+
+# TODO: find better way to import this without hard coding it here
+# define the shared model
+class SharedModel(GaussianMixin, DeterministicMixin, Model):
+    def __init__(self, observation_space, action_space, device, clip_actions=False,
+                clip_log_std=True, min_log_std=-20, max_log_std=2, reduction="sum"):
+        Model.__init__(self, observation_space, action_space, device)
+        GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std, reduction, role="policy")
+        DeterministicMixin.__init__(self, clip_actions, role="value")
+
+        # shared layers/network
+        self.net = nn.Sequential(nn.Linear(self.num_observations, 32),
+                                 nn.ELU(),
+                                 nn.Linear(32, 32),
+                                 nn.ELU())
+
+        # separated layers ("policy")
+        self.mean_layer = nn.Linear(32, self.num_actions)
+        self.log_std_parameter = nn.Parameter(torch.zeros(self.num_actions))
+
+        # separated layer ("value")
+        self.value_layer = nn.Linear(32, 1)
+
+    # override the .act(...) method to disambiguate its call
+    def act(self, inputs, role):
+        if role == "policy":
+            return GaussianMixin.act(self, inputs, role)
+        elif role == "value":
+            return DeterministicMixin.act(self, inputs, role)
+
+    # forward the input to compute model output according to the specified role
+    def compute(self, inputs, role):
+        if role == "policy":
+            # save shared layers/network output to perform a single forward-pass
+            self._shared_output = self.net(inputs["states"])
+            return self.mean_layer(self._shared_output), self.log_std_parameter, {}
+        elif role == "value":
+            # use saved shared layers/network output to perform a single forward-pass, if it was saved
+            shared_output = self.net(inputs["states"]) if self._shared_output is None else self._shared_output
+            self._shared_output = None  # reset saved shared output to prevent the use of erroneous data in subsequent steps
+            return self.value_layer(shared_output), {}
 
 def generate_equally_spaced_scopes(num_envs: int, num_simultaneous_agents: int) -> List[int]:
     """Generate a list of equally spaced scopes for the agents
@@ -75,8 +119,15 @@ class Trainer:
 
         # setup adversary
         num_inputs = 12 # arbitrary number of inputs
-        num_clutter_objects = self.cfg["num_clutter_objects"]
-        self.adversary = LinearNetwork(num_inputs, 64, 64, num_clutter_objects)
+        num_outputs = self.cfg["num_clutter_objects"] * 3
+        models = {
+            "policy": SharedModel(num_inputs, num_outputs, device=env.device),
+            "value": self.agents.models["value"]
+        }
+        self.adversary = PPO(
+            models=models,
+            device=env.device
+        )
 
         # register environment closing if configured
         if self.close_environment_at_exit:
@@ -186,7 +237,9 @@ class Trainer:
 
         # reset env
         for i in range(self.env.num_envs):
-            self.env._env.adversary_action[i] =  self.adversary.sample()
+            rand_state = torch.randn(12, device=self.env.device)
+            adversary_action = self.adversary.act(rand_state, timestep=0, timesteps=self.timesteps)[0]
+            self.env._env.adversary_action[i] = adversary_action
         states, infos = self.env.reset()
 
         for timestep in tqdm.tqdm(
@@ -195,6 +248,7 @@ class Trainer:
 
             # pre-interaction
             self.agents.pre_interaction(timestep=timestep, timesteps=self.timesteps)
+            self.adversary.pre_interaction(timestep=timestep, timesteps=self.timesteps)
 
             with torch.no_grad():
                 # compute actions
@@ -236,7 +290,23 @@ class Trainer:
                     # loop through all envs that need to be reset and update their adversary action
                     reset_env_ids = self.env.reset_buf.nonzero(as_tuple=False).squeeze(-1)
                     for i in reset_env_ids:
-                        self.env._env.adversary_action[i] = self.adversary.sample()
+                        rand_state = torch.randn(12)
+                        adversary_action = self.adversary.act(rand_state, timestep=timestep, timesteps=self.timesteps)[0]
+                        self.env._env.adversary_action[i] = adversary_action
+                
+                    self.adversary.record_transition(
+                        states=rand_state,
+                        actions=adversary_action,
+                        rewards=(-1 * rewards),
+                        next_states=states,
+                        terminated=terminated,
+                        truncated=truncated,
+                        infos=infos,
+                        timestep=timestep,
+                        timesteps=self.timesteps,
+                    )
+
+                self.adversary.post_interaction(timestep=timestep, timesteps=self.timesteps)
                         
 
     def single_agent_eval(self) -> None:

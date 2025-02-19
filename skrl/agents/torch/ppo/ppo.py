@@ -233,6 +233,8 @@ class PPO(Agent):
         :return: Actions
         :rtype: torch.Tensor
         """
+        states = states.to(self.device)
+        
         # sample random actions
         # TODO, check for stochasticity
         if timestep < self._random_timesteps:
