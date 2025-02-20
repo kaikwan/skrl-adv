@@ -186,8 +186,10 @@ class Trainer:
 
         # reset env
         for i in range(self.env.num_envs):
-            self.env._env.adversary_action[i] =  self.adversary.sample()
+            self.env.unwrapped.adversary_action[i] =  self.adversary.sample()
         states, infos = self.env.reset()
+
+        zero_actions = torch.zeros((self.env.num_envs, self.env.action_space.shape[0])).to(self.env.device)
 
         for timestep in tqdm.tqdm(
             range(self.initial_timestep, self.timesteps), disable=self.disable_progressbar, file=sys.stdout
@@ -231,12 +233,17 @@ class Trainer:
 
             # reset environments
             states = next_states
-            if timestep == 0 or terminated.any() or truncated.any():
-                with torch.no_grad():
-                    # loop through all envs that need to be reset and update their adversary action
-                    reset_env_ids = self.env.reset_buf.nonzero(as_tuple=False).squeeze(-1)
-                    for i in reset_env_ids:
-                        self.env._env.adversary_action[i] = self.adversary.sample()
+
+            if terminated.any() or truncated.any():
+                reset_env_ids = [i for i in range(self.env.num_envs) if terminated[i] or truncated[i]]
+                if len(reset_env_ids) == self.env.num_envs:
+                    with torch.no_grad():
+                        # loop through all envs that need to be reset and update their adversary action
+                        for i in reset_env_ids:
+                            self.env.unwrapped.adversary_action[i] = self.adversary.sample()
+                        for i in range(100):
+                            self.env.step(zero_actions)
+
                         
 
     def single_agent_eval(self) -> None:

@@ -25,4 +25,4 @@ class LinearNetwork(nn.Module):
     def sample(self):
         # input = torch.randn(size=(self.input_dim,))
         # return self.forward(input)
-        return torch.randn(size=(self.num_clutter_objects * 3,)) * 2 - 1
+        return torch.rand(size=(self.num_clutter_objects * 3,)) * 2 - 1
