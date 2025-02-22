@@ -641,6 +641,7 @@ class PPO_RNN(Agent):
             if self._learning_rate_scheduler:
                 if isinstance(self.scheduler, KLAdaptiveLR):
                     kl = torch.tensor(kl_divergences, device=self.device).mean()
+                    self.track_data("Policy / KL", kl.item())
                     # reduce (collect from all workers/processes) KL in distributed runs
                     if config.torch.is_distributed:
                         torch.distributed.all_reduce(kl, op=torch.distributed.ReduceOp.SUM)

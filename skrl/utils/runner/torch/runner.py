@@ -10,6 +10,7 @@ from skrl.resources.noises.torch import GaussianNoise, OrnsteinUhlenbeckNoise  #
 from skrl.resources.preprocessors.torch import RunningStandardScaler  # noqa
 from skrl.resources.schedulers.torch import KLAdaptiveLR  # noqa
 from skrl.trainers.torch import Trainer
+from skrl.models.torch.custom import SharedRNN
 from skrl.utils import set_seed
 
 
@@ -115,6 +116,10 @@ class Runner:
             from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
 
             component = PPO_DEFAULT_CONFIG if "default_config" in name else PPO
+        elif name in ["ppo_rnn", "ppo_rnn_default_config"]:
+            from skrl.agents.torch.ppo import PPO_RNN as PPO, PPO_DEFAULT_CONFIG
+
+            component = PPO_DEFAULT_CONFIG if "default_config" in name else PPO
         elif name in ["rpo", "rpo_default_config"]:
             from skrl.agents.torch.rpo import RPO, RPO_DEFAULT_CONFIG
 
@@ -214,13 +219,46 @@ class Runner:
             models_cfg = _cfg.get("models")
             if not models_cfg:
                 raise ValueError("No 'models' are defined in cfg")
-            # get separate (non-shared) configuration and remove 'separate' key
+            
+            try:
+                custom_network = models_cfg["custom_network"]
+                del models_cfg["custom_network"]
+            except KeyError:
+                custom_network = False
+                logger.warning("No 'custom_network' field defined in 'models' cfg. Defining it as False by default")
+            
             try:
                 separate = models_cfg["separate"]
                 del models_cfg["separate"]
             except KeyError:
                 separate = True
                 logger.warning("No 'separate' field defined in 'models' cfg. Defining it as True by default")
+
+            if custom_network:
+                if agent_class == "ppo_rnn":
+                    roles = list(models_cfg.keys())
+                    model_parameters = self._process_cfg(models_cfg[roles[0]])
+                    del model_parameters["class"]
+                    model_parameters["num_envs"] = env.num_envs
+                    models[agent_id][roles[0]] = SharedRNN(observation_spaces[agent_id], action_spaces[agent_id], device, **model_parameters)
+                    models[agent_id][roles[1]] = models[agent_id][roles[0]]
+                    print("==================================================")
+                    print(f"Model (roles): {roles}")
+                    print("==================================================\n")
+                    print(models)
+                    print("--------------------------------------------------")
+                else:
+                    raise ValueError(f"No custom_network for model defined for {agent_class}")
+
+                # TODO(kaikwan): Investigate if there's actually any difference        
+                # Doesn't work with PPO RNN since it requires rnn states to compute in init_state_dict
+                # initialize lazy modules' parameters
+                # for agent_id in possible_agents:
+                #     for role, model in models[agent_id].items():
+                #         model.init_state_dict(role)
+
+                return models
+
             # non-shared models
             if separate:
                 for role in models_cfg:
@@ -405,7 +443,7 @@ class Runner:
                 "reply_buffer": reply_buffer,
                 "collect_reference_motions": lambda num_samples: env.collect_reference_motions(num_samples),
             }
-        elif agent_class in ["a2c", "cem", "ddpg", "ddqn", "dqn", "ppo", "rpo", "sac", "td3", "trpo"]:
+        elif agent_class in ["a2c", "cem", "ddpg", "ddqn", "dqn", "ppo", "rpo", "sac", "td3", "trpo", "ppo_rnn"]:
             agent_id = possible_agents[0]
             agent_cfg = self._component(f"{agent_class}_DEFAULT_CONFIG").copy()
             agent_cfg.update(self._process_cfg(cfg["agent"]))
