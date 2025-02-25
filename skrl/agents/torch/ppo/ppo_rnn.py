@@ -1,4 +1,5 @@
 from typing import Any, Mapping, Optional, Tuple, Union
+import os 
 
 import copy
 import itertools
@@ -14,7 +15,7 @@ from skrl.agents.torch import Agent
 from skrl.memories.torch import Memory
 from skrl.models.torch import Model
 from skrl.resources.schedulers.torch import KLAdaptiveLR
-
+from skrl.models.torch.custom.lstm_classifier import LSTMClassifier
 
 # fmt: off
 # [start-config-dict-torch]
@@ -195,6 +196,9 @@ class PPO_RNN(Agent):
             self.checkpoint_modules["value_preprocessor"] = self._value_preprocessor
         else:
             self._value_preprocessor = self._empty_preprocessor
+        self.lstm_classifier = LSTMClassifier(input_size=observation_space.shape[0] - 3, hidden_size=64, output_size=3, num_envs=self.cfg["num_envs"]).to(device)
+        self.lstm_optimizer = torch.optim.Adam(self.lstm_classifier.parameters(), lr=1e-3)
+        self.criterion = nn.MSELoss()
 
     def init(self, trainer_cfg: Optional[Mapping[str, Any]] = None) -> None:
         """Initialize the agent"""
@@ -232,14 +236,23 @@ class PPO_RNN(Agent):
         self._rnn_initial_states = {"policy": [], "value": []}
         self._rnn_sequence_length = self.policy.get_specification().get("rnn", {}).get("sequence_length", 1)
 
-        # policy
+        # LSTM specifications
+        # self._lstm = False  # flag to indicate whether RNN is available
+        self._lstm_tensors_names = []  # used for sampling during training
+        self._lstm_final_states = {"policy": []}
+        self._lstm_initial_states = {"policy": []}
+        self._lstm_sequence_length = self.lstm_classifier.get_specification().get("lstm", {}).get("sequence_length", 1)
+        # import pdb ; pdb.set_trace()
+        # policy 
         for i, size in enumerate(self.policy.get_specification().get("rnn", {}).get("sizes", [])):
+            # len(sizes) = 1 usually
+            # size = (num_layers, num_envs, hidden_size) 
             self._rnn = True
             # create tensors in memory
             if self.memory is not None:
                 self.memory.create_tensor(
                     name=f"rnn_policy_{i}", size=(size[0], size[2]), dtype=torch.float32, keep_dimensions=True
-                )
+                ) # num_layers, hidden_size
                 self._rnn_tensors_names.append(f"rnn_policy_{i}")
             # default RNN states
             self._rnn_initial_states["policy"].append(torch.zeros(size, dtype=torch.float32, device=self.device))
@@ -259,6 +272,18 @@ class PPO_RNN(Agent):
                         self._rnn_tensors_names.append(f"rnn_value_{i}")
                     # default RNN states
                     self._rnn_initial_states["value"].append(torch.zeros(size, dtype=torch.float32, device=self.device))
+
+        # LSTM classifier
+        for i, size in enumerate(self.lstm_classifier.get_specification().get("lstm", {}).get("sizes", [])):
+            # self._lstm = True
+            # create tensors in memory
+            if self.memory is not None:
+                self.memory.create_tensor(
+                    name=f"lstm_policy_{i}", size=(size[0], size[2]), dtype=torch.float32, keep_dimensions=True
+                ) # num_layers, hidden_size
+                self._lstm_tensors_names.append(f"lstm_policy_{i}")
+            # default RNN states
+            self._lstm_initial_states["policy"].append(torch.zeros(size, dtype=torch.float32, device=self.device))
 
         # create temporary variables needed for storage and computation
         self._current_log_prob = None
@@ -293,6 +318,16 @@ class PPO_RNN(Agent):
 
         if self._rnn:
             self._rnn_final_states["policy"] = outputs.get("rnn", [])
+
+        lstm = {"lstm": self._lstm_initial_states["policy"]} # if self._lstm else {}
+        pred, lstm_output = self.lstm_classifier.compute({"states": self._state_preprocessor(states)[:, :-3], **lstm})
+        self._lstm_final_states["policy"] = lstm_output.get("lstm", [])
+
+        outputs.update(lstm_output)
+        pred_res = torch.zeros_like(states)
+        pred_res[:, -3:] = pred
+        outputs.update({"pred": self._state_preprocessor(pred_res, inverse=True)[:, -3:]})
+        # print("pred_res: ", self._state_preprocessor(pred_res, inverse=True))
 
         return actions, log_prob, outputs
 
@@ -351,7 +386,7 @@ class PPO_RNN(Agent):
                 rewards += self._discount_factor * values * truncated
 
             # package RNN states
-            rnn_states = {}
+            rnn_states = {} # [num_envs, num_layers, hidden_size]
             if self._rnn:
                 rnn_states.update(
                     {f"rnn_policy_{i}": s.transpose(0, 1) for i, s in enumerate(self._rnn_initial_states["policy"])}
@@ -360,6 +395,9 @@ class PPO_RNN(Agent):
                     rnn_states.update(
                         {f"rnn_value_{i}": s.transpose(0, 1) for i, s in enumerate(self._rnn_initial_states["value"])}
                     )
+
+            # package LSTM states
+            lstm_states = {f"lstm_policy_{i}": s.transpose(0, 1) for i, s in enumerate(self._lstm_initial_states["policy"])}
 
             # storage transition in memory
             self.memory.add_samples(
@@ -372,6 +410,7 @@ class PPO_RNN(Agent):
                 log_prob=self._current_log_prob,
                 values=values,
                 **rnn_states,
+                **lstm_states
             )
             for memory in self.secondary_memories:
                 memory.add_samples(
@@ -384,24 +423,56 @@ class PPO_RNN(Agent):
                     log_prob=self._current_log_prob,
                     values=values,
                     **rnn_states,
+                    **lstm_states
                 )
 
         # update RNN states
         if self._rnn:
-            self._rnn_final_states["value"] = (
+            self._rnn_final_states["value"] = ( # [1, num_envs, hidden_size]
                 self._rnn_final_states["policy"] if self.policy is self.value else outputs.get("rnn", [])
             )
 
             # reset states if the episodes have ended
-            finished_episodes = (terminated | truncated).nonzero(as_tuple=False)
-            if finished_episodes.numel():
+            finished_episodes = (terminated | truncated).nonzero(as_tuple=False) # [num_envs, 2] (0 is env index) 
+            if finished_episodes.numel(): # len(finished_episodes) > 0
                 for rnn_state in self._rnn_final_states["policy"]:
+                    # set all the hidden states to zero for the envs that have finished
                     rnn_state[:, finished_episodes[:, 0]] = 0
                 if self.policy is not self.value:
                     for rnn_state in self._rnn_final_states["value"]:
                         rnn_state[:, finished_episodes[:, 0]] = 0
-
             self._rnn_initial_states = self._rnn_final_states
+
+        # # update LSTM states
+        # if self._lstm:
+        finished_episodes = (terminated | truncated).nonzero(as_tuple=False)
+        if finished_episodes.numel():
+            for lstm_state in self._lstm_final_states["policy"]:
+                lstm_state[:, finished_episodes[:, 0]] = 0
+        self._lstm_initial_states = self._lstm_final_states
+
+    def write_checkpoint(self, timestep: int, timesteps: int) -> None:
+        """Write checkpoint (modules) to disk
+
+        The checkpoints are saved in the directory 'checkpoints' in the experiment directory.
+        The name of the checkpoint is the current timestep if timestep is not None, otherwise it is the current time.
+
+        :param timestep: Current timestep
+        :type timestep: int
+        :param timesteps: Number of timesteps
+        :type timesteps: int
+        """
+        super().write_checkpoint(timestep, timesteps)
+        tag = str(timestep if timestep is not None else datetime.datetime.now().strftime("%y-%m-%d_%H-%M-%S-%f"))
+        torch.save(self.lstm_classifier.state_dict(), os.path.join(self.experiment_dir, "checkpoints", f"lstm_classifier_{tag}.pt"))
+
+    def load_lstm(self, checkpoint_path: str) -> None:
+        """Load the LSTM classifier from a checkpoint
+
+        :param checkpoint_path: Path to the checkpoint
+        :type checkpoint_path: str
+        """
+        self.lstm_classifier.load_state_dict(torch.load(checkpoint_path))
 
     def pre_interaction(self, timestep: int, timesteps: int) -> None:
         """Callback called before the interaction with the environment
@@ -523,6 +594,12 @@ class PPO_RNN(Agent):
                 sequence_length=self._rnn_sequence_length,
             )
 
+        sampled_lstm_batches = self.memory.sample_all(
+            names=self._lstm_tensors_names,
+            mini_batches=self._mini_batches,
+            sequence_length=self._lstm_sequence_length,
+        )
+
         cumulative_policy_loss = 0
         cumulative_entropy_loss = 0
         cumulative_value_loss = 0
@@ -567,10 +644,53 @@ class PPO_RNN(Agent):
                             ],
                             "terminated": sampled_terminated | sampled_truncated,
                         }
+                lstm_cla = {
+                    "lstm": [s.transpose(0, 1) for s in sampled_lstm_batches[i]],
+                    "terminated": sampled_terminated | sampled_truncated,
+                }
 
                 with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
 
                     sampled_states = self._state_preprocessor(sampled_states, train=not epoch)
+
+                    output_seq = self.lstm_classifier.compute(
+                        {"states": sampled_states[:, :-3], **lstm_cla}
+                    )
+                    pred_target_pose = output_seq[0]
+
+                    # get target pose from memory
+                    sampled_target_pose_seq = sampled_states[:, -3:]
+
+                    # get sampled_target_pose at terminals only
+                    if (sampled_terminated | sampled_truncated).any():
+                        finished_episodes = (sampled_terminated | sampled_truncated).nonzero(as_tuple=False)
+
+                        sampled_target_pose = sampled_target_pose_seq[finished_episodes[:, 0]] # TODO: test
+                        
+                        pred_target_pose = pred_target_pose[finished_episodes[:, 0]]
+
+                        pred_inverse = torch.zeros_like(sampled_states[finished_episodes[:, 0]]) 
+                        pred_inverse[:, -3:] = pred_target_pose
+                        pred_inverse = self._state_preprocessor(pred_inverse, inverse=True)[:, -3:]
+                        # print("inverse ", pred_inverse)
+                        true_inverse = torch.zeros_like(sampled_states[finished_episodes[:, 0]])
+                        true_inverse[:, -3:] = sampled_target_pose
+                        true_inverse = self._state_preprocessor(true_inverse, inverse=True)[:, -3:]
+                        # print("true ", true_inverse)
+
+
+                        lstm_loss = self.criterion(pred_target_pose, sampled_target_pose)
+                        self.lstm_optimizer.zero_grad()
+                        lstm_loss.backward()
+                        self.lstm_optimizer.step()        
+                        self.track_data("Loss / LSTM loss", lstm_loss.item())
+
+                        # define accurate as with in 1e-2 of the true value
+                        accuracy = torch.sum(torch.abs(pred_inverse - true_inverse) < 1e-2) / (3 * pred_inverse.shape[0])
+                        self.track_data("LSTM / Accuracy", accuracy.item())
+                        
+                        inversed_accuracy = torch.sum(torch.abs(pred_target_pose - sampled_target_pose) < 1e-2) / (3 * pred_target_pose.shape[0])
+                        self.track_data("LSTM / True Accuracy", inversed_accuracy.item())
 
                     _, next_log_prob, _ = self.policy.act(
                         {"states": sampled_states, "taken_actions": sampled_actions, **rnn_policy}, role="policy"

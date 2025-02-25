@@ -62,7 +62,7 @@ class Memory:
         self.tensors_keep_dimensions = {}
 
         self.sampling_indexes = None
-        self.all_sequence_indexes = np.concatenate(
+        self.all_sequence_indexes = np.concatenate( # indexes of the sequences for each env [env_0 indicies, env_1 indicies, ...]
             [np.arange(i, memory_size * num_envs + i, num_envs) for i in range(num_envs)]
         )
 

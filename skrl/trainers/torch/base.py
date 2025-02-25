@@ -195,6 +195,17 @@ class Trainer:
                 # step the environments
                 next_states, rewards, terminated, truncated, infos = self.env.step(actions)
 
+                ##################TODO: add LSTM reward######################
+                # rewards = compute_lstm_reward(states, next_states, rewards, terminated, truncated, infos)
+                # def compute_lstm_reward(states, next_states, rewards, terminated, truncated, infos):
+                #   terminated_envs = terminated.any(dim=1)
+                #   pred_target_pose = lstm(memory for whole traj[terminated_envs])
+                #   if pred_target_pose is close to target_pose or use prediction_error as reward
+                #       rew = 1
+                #   rewards[terminated_envs] = rew
+                #   return rewards
+                ################################################################
+
                 # render scene
                 if not self.headless:
                     self.env.render()
@@ -278,6 +289,16 @@ class Trainer:
                     timestep=timestep,
                     timesteps=self.timesteps,
                 )
+
+                # print LSTM results
+                if (terminated | truncated).any():
+                    with torch.no_grad():
+                        finished_envs = (terminated | truncated).nonzero(as_tuple=True)[0]
+                        for env in finished_envs:
+                            true_target_pose = states[env, -3:]
+                            pred_target_pose = outputs[-1]["pred"][env]
+                            print(f"True target pose: {true_target_pose}")
+                            print(f"Predicted target pose: {pred_target_pose}")
 
                 # log environment info
                 if self.environment_info in infos:

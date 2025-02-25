@@ -459,6 +459,8 @@ class Runner:
                 agent_cfg["smooth_regularization_noise"] = agent_cfg["smooth_regularization_noise"](
                     **agent_cfg.get("smooth_regularization_noise_kwargs", {})
                 )
+            if agent_class == "ppo_rnn":
+                agent_cfg["num_envs"] = num_envs
             agent_kwargs = {
                 "models": models[agent_id],
                 "memory": memories[agent_id],

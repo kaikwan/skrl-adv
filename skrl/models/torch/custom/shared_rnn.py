@@ -25,7 +25,6 @@ class SharedRNN(GaussianMixin, DeterministicMixin, Model):
         self.num_layers = num_layers
         self.hidden_size = hidden_size  # Hout
         self.sequence_length = sequence_length
-
         self.rnn = nn.RNN(input_size=self.num_observations,
                           hidden_size=self.hidden_size,
                           num_layers=self.num_layers,
@@ -38,7 +37,7 @@ class SharedRNN(GaussianMixin, DeterministicMixin, Model):
                                  nn.ELU())
 
         self.policy_layer = nn.LazyLinear(out_features=self.num_actions)
-        self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=initial_log_std), requires_grad=True)
+        self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=initial_log_std), requires_grad=False)
         self.value_layer = nn.LazyLinear(out_features=1)
 
 
@@ -56,13 +55,13 @@ class SharedRNN(GaussianMixin, DeterministicMixin, Model):
     
     def compute(self, inputs, role=""):
         if role == "policy":
-            states = inputs["states"]
-            terminated = inputs.get("terminated", None)
-            hidden_states = inputs["rnn"][0]
-
+            states = inputs["states"] # num_envs * rollouts / minibatch, observation_size
+            terminated = inputs.get("terminated", None) # num_envs * rollouts / minibatch 
+            hidden_states = inputs["rnn"][0] # num_layers, num_envs * rollouts / minibatch, hidden_size
             # training
             if self.training:
-                rnn_input = states.view(-1, self.sequence_length, states.shape[-1])  # (N, L, Hin): N=batch_size, L=sequence_length
+                # import pdb; pdb.set_trace()
+                rnn_input = states.view(-1, self.sequence_length, states.shape[-1])  # (N, L, Hin): N=batch_size, L=sequence_length, Hin=observation_size
                 hidden_states = hidden_states.view(self.num_layers, -1, self.sequence_length, hidden_states.shape[-1])  # (D * num_layers, N, L, Hout)
                 # get the hidden states corresponding to the initial sequence
                 hidden_states = hidden_states[:,:,0,:].contiguous()  # (D * num_layers, N, Hout)
@@ -75,7 +74,7 @@ class SharedRNN(GaussianMixin, DeterministicMixin, Model):
 
                     for i in range(len(indexes) - 1):
                         i0, i1 = indexes[i], indexes[i + 1]
-                        rnn_output, hidden_states = self.rnn(rnn_input[:,i0:i1,:], hidden_states)
+                        rnn_output, hidden_states = self.rnn(rnn_input[:,i0:i1,:], hidden_states) # rnn_input = (N, i0:i1, Hin), hidden_states = (D * num_layers, N, Hout)
                         hidden_states[:, (terminated[:,i1-1]), :] = 0
                         rnn_outputs.append(rnn_output)
 
