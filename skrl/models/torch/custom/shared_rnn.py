@@ -37,7 +37,7 @@ class SharedRNN(GaussianMixin, DeterministicMixin, Model):
                                  nn.ELU())
 
         self.policy_layer = nn.LazyLinear(out_features=self.num_actions)
-        self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=initial_log_std), requires_grad=False)
+        self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=initial_log_std), requires_grad=True)
         self.value_layer = nn.LazyLinear(out_features=1)
 
 

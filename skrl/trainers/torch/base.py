@@ -190,21 +190,31 @@ class Trainer:
 
             with torch.no_grad():
                 # compute actions
-                actions = self.agents.act(states, timestep=timestep, timesteps=self.timesteps)[0]
+                outputs = self.agents.act(states, timestep=timestep, timesteps=self.timesteps)
+                actions = outputs[0]
 
                 # step the environments
                 next_states, rewards, terminated, truncated, infos = self.env.step(actions)
 
-                ##################TODO: add LSTM reward######################
-                # rewards = compute_lstm_reward(states, next_states, rewards, terminated, truncated, infos)
-                # def compute_lstm_reward(states, next_states, rewards, terminated, truncated, infos):
-                #   terminated_envs = terminated.any(dim=1)
-                #   pred_target_pose = lstm(memory for whole traj[terminated_envs])
-                #   if pred_target_pose is close to target_pose or use prediction_error as reward
-                #       rew = 1
-                #   rewards[terminated_envs] = rew
-                #   return rewards
-                ################################################################
+                # print LSTM results
+                if (terminated | truncated).any():
+                    with torch.no_grad():
+                        finished_envs = (terminated | truncated).nonzero(as_tuple=True)[0]
+                        true_target_pose = states[finished_envs, -3:]
+                        pred_target_pose = outputs[-1]["pred"][finished_envs]
+                        std_weight = 40
+                        finegrained_weight = 20
+                        std_stdev = 1.0
+                        finegrained_stdev = 0.01
+                        distance = torch.norm(true_target_pose - pred_target_pose, dim=1)
+                        pred_reward = (1 - torch.tanh(distance / std_stdev)) * std_weight
+                        pred_finegrained_reward = (1 - torch.tanh(distance / finegrained_stdev)) * finegrained_weight
+                        self.agents.track_data("Info / Epsiode Reward / Prediction Reward", pred_reward.cpu())
+                        self.agents.track_data("Info / Epsiode Reward / Prediction Finegrained Reward", pred_finegrained_reward.cpu())
+                        rewards[finished_envs] += pred_reward.unsqueeze(1)
+                        rewards[finished_envs] += pred_finegrained_reward.unsqueeze(1)
+                        # print(f"True target pose: {true_target_pose}")
+                        # print(f"Predicted target pose: {pred_target_pose}")
 
                 # render scene
                 if not self.headless:
