@@ -12,10 +12,11 @@ from skrl.agents.torch import Agent
 from skrl.envs.wrappers.torch import Wrapper
 from skrl.agents.torch.ppo import PPO
 from skrl.models.torch import Model, GaussianMixin, DeterministicMixin
+from skrl.memories.torch import RandomMemory
 
-from omni.isaac.lab_tasks.utils.nets.config_adversary import LinearNetwork
 
 # TODO: find better way to import this without hard coding it here
+# although it seems like this is hard coded at the top of the files for SKRL demos too
 # define the shared model
 class SharedModel(GaussianMixin, DeterministicMixin, Model):
     def __init__(self, observation_space, action_space, device, clip_actions=False,
@@ -36,6 +37,9 @@ class SharedModel(GaussianMixin, DeterministicMixin, Model):
 
         # separated layer ("value")
         self.value_layer = nn.Linear(32, 1)
+
+        # Shared value is 0
+        self._shared_output = None
 
     # override the .act(...) method to disambiguate its call
     def act(self, inputs, role):
@@ -118,16 +122,26 @@ class Trainer:
         self._setup_agents()
 
         # setup adversary
-        num_inputs = 12 # arbitrary number of inputs
+        num_inputs = 12 # arbitrary number of inputs, is a noise vector to condition on
         num_outputs = self.cfg["num_clutter_objects"] * 3
-        models = {
-            "policy": SharedModel(num_inputs, num_outputs, device=env.device),
-            "value": self.agents.models["value"]
+        adversary_shared_model = SharedModel(num_inputs, num_outputs, device=env.device)
+        models = { # TODO: not sure if this is supposed to be shared
+            "policy": adversary_shared_model,
+            "value": adversary_shared_model
         }
+        adversary_cfg = {
+            "rollouts": 1
+        }
+
         self.adversary = PPO(
             models=models,
-            device=env.device
+            device=env.device,
+            observation_space=num_inputs,
+            action_space=num_outputs,
+            memory=RandomMemory(num_envs=self.env.num_envs, memory_size=adversary_cfg["rollouts"], device=env.device),
+            cfg=adversary_cfg
         )
+        self.adversary.init()
 
         # register environment closing if configured
         if self.close_environment_at_exit:
@@ -239,9 +253,10 @@ class Trainer:
         for i in range(self.env.num_envs):
             rand_state = torch.randn(12, device=self.env.device)
             adversary_action = self.adversary.act(rand_state, timestep=0, timesteps=self.timesteps)[0]
-            self.env._env.adversary_action[i] = adversary_action
+            self.env._env.env.adversary_action[i] = adversary_action
         states, infos = self.env.reset()
 
+        prev_adversary_action = adversary_action
         for timestep in tqdm.tqdm(
             range(self.initial_timestep, self.timesteps), disable=self.disable_progressbar, file=sys.stdout
         ):
@@ -292,21 +307,25 @@ class Trainer:
                     for i in reset_env_ids:
                         rand_state = torch.randn(12)
                         adversary_action = self.adversary.act(rand_state, timestep=timestep, timesteps=self.timesteps)[0]
-                        self.env._env.adversary_action[i] = adversary_action
+                        self.env._env.env.adversary_action[i] = adversary_action
                 
-                    self.adversary.record_transition(
-                        states=rand_state,
-                        actions=adversary_action,
-                        rewards=(-1 * rewards),
-                        next_states=states,
-                        terminated=terminated,
-                        truncated=truncated,
-                        infos=infos,
-                        timestep=timestep,
-                        timesteps=self.timesteps,
-                    )
+                    if timestep > 0:
+                        # TODO: unsure about assignment of states and next_states
+                        self.adversary.record_transition(
+                            states=rand_state.repeat(self.env.num_envs, 1).to(self.env.device),
+                            actions=prev_adversary_action.repeat(self.env.num_envs, 1).to(self.env.device),
+                            rewards=(-1 * rewards),
+                            next_states=rand_state.repeat(self.env.num_envs, 1).to(self.env.device),
+                            terminated=terminated,
+                            truncated=truncated,
+                            infos=infos,
+                            timestep=timestep,
+                            timesteps=self.timesteps,
+                        )
+                        prev_adversary_action = adversary_action
 
-                self.adversary.post_interaction(timestep=timestep, timesteps=self.timesteps)
+                if timestep > 0:
+                    self.adversary.post_interaction(timestep=timestep, timesteps=self.timesteps)
                         
 
     def single_agent_eval(self) -> None:
