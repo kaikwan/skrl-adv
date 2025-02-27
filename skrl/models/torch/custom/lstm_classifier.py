@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class LSTMClassifier(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, num_layers=1, sequence_length=128, num_envs=1):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=1, sequence_length=512, num_envs=1):
         super(LSTMClassifier, self).__init__()
         self.lstm = nn.RNN(input_size, hidden_size, num_layers, batch_first=True) # 36, 
         self.fc = nn.Linear(hidden_size, output_size)
@@ -17,13 +17,6 @@ class LSTMClassifier(nn.Module):
         # batch size (N) is the number of envs
         return {"lstm": {"sequence_length": self.sequence_length,
                         "sizes": [(self.num_layers, self.num_envs, self.hidden_size)]}}  # hidden states (D ∗ num_layers, N, Hout)
-
-    def forward(self, x):
-        h_0 = torch.zeros(self.lstm.num_layers, x.size(0), self.lstm.hidden_size).to(x.device)
-        c_0 = torch.zeros(self.netlstm.num_layers, x.size(0), self.lstm.hidden_size).to(x.device)
-        out, _ = self.lstm(x, (h_0, c_0))
-        out = self.fc(out[:, -1, :])
-        return out
 
     def compute(self, inputs):
         states = inputs["states"] # num_envs * rollouts / minibatch, observation_size

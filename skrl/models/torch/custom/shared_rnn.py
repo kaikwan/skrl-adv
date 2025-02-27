@@ -16,7 +16,7 @@ from skrl.utils.spaces.torch import unflatten_tensorized_space
 class SharedRNN(GaussianMixin, DeterministicMixin, Model):
     def __init__(self, observation_space, action_space, device, clip_actions=False,
                  clip_log_std=True, min_log_std=-20, max_log_std=2, reduction="sum", initial_log_std=0,
-                 num_envs=1, num_layers=1, hidden_size=64, sequence_length=128):
+                 num_envs=1, num_layers=3, hidden_size=128, sequence_length=512):
         Model.__init__(self, observation_space, action_space, device)
         GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std, reduction, role="policy")
         DeterministicMixin.__init__(self, clip_actions, role="value")
@@ -25,7 +25,7 @@ class SharedRNN(GaussianMixin, DeterministicMixin, Model):
         self.num_layers = num_layers
         self.hidden_size = hidden_size  # Hout
         self.sequence_length = sequence_length
-        self.rnn = nn.RNN(input_size=self.num_observations,
+        self.rnn = nn.RNN(input_size=self.num_observations-3, # remove target object pose
                           hidden_size=self.hidden_size,
                           num_layers=self.num_layers,
                           batch_first=True)  # batch_first -> (batch, sequence, features)
@@ -37,7 +37,7 @@ class SharedRNN(GaussianMixin, DeterministicMixin, Model):
                                  nn.ELU())
 
         self.policy_layer = nn.LazyLinear(out_features=self.num_actions)
-        self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=initial_log_std), requires_grad=True)
+        self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=initial_log_std), requires_grad=False)
         self.value_layer = nn.LazyLinear(out_features=1)
 
 
@@ -48,6 +48,7 @@ class SharedRNN(GaussianMixin, DeterministicMixin, Model):
 
 
     def act(self, inputs, role):
+        inputs['states'] = inputs['states'][:, :-3] # remove target object pose
         if role == "policy":
             return GaussianMixin.act(self, inputs, role)
         elif role == "value":

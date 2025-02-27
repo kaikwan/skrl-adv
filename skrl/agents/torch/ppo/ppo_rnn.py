@@ -685,11 +685,11 @@ class PPO_RNN(Agent):
                         self.lstm_optimizer.step()        
                         self.track_data("Loss / LSTM loss", lstm_loss.item())
 
-                        # define accurate as with in 1e-2 of the true value
-                        accuracy = torch.sum(torch.abs(pred_inverse - true_inverse) < 1e-2) / (3 * pred_inverse.shape[0])
+                        # define accurate as with in 3e-2 of the true value
+                        accuracy = torch.sum(torch.abs(pred_inverse - true_inverse) < 3e-2) / (3 * pred_inverse.shape[0])
                         self.track_data("LSTM / Accuracy", accuracy.item())
                         
-                        inversed_accuracy = torch.sum(torch.abs(pred_target_pose - sampled_target_pose) < 1e-2) / (3 * pred_target_pose.shape[0])
+                        inversed_accuracy = torch.sum(torch.abs(pred_target_pose - sampled_target_pose) < 3e-2) / (3 * pred_target_pose.shape[0])
                         self.track_data("LSTM / True Accuracy", inversed_accuracy.item())
 
                     _, next_log_prob, _ = self.policy.act(
