@@ -250,13 +250,17 @@ class Trainer:
         assert self.env.num_agents == 1, "This method is not allowed for multi-agents"
 
         # reset env
+        ADVERSARY_ACTION_SPACE = self.env._env.env.adversary_action.shape[-1]
+        prev_rand_state = torch.randn((self.env.num_envs, 12), device=self.env.device)
+        prev_adversary_action = torch.zeros((self.env.num_envs, ADVERSARY_ACTION_SPACE), device=self.env.device)
         for i in range(self.env.num_envs):
             rand_state = torch.randn(12, device=self.env.device)
             adversary_action = self.adversary.act(rand_state, timestep=0, timesteps=self.timesteps)[0]
             self.env._env.env.adversary_action[i] = adversary_action
+            prev_rand_state[i] = rand_state
+            prev_adversary_action[i] = adversary_action
         states, infos = self.env.reset()
 
-        prev_adversary_action = adversary_action
         for timestep in tqdm.tqdm(
             range(self.initial_timestep, self.timesteps), disable=self.disable_progressbar, file=sys.stdout
         ):
@@ -304,25 +308,30 @@ class Trainer:
                 with torch.no_grad():
                     # loop through all envs that need to be reset and update their adversary action
                     reset_env_ids = self.env.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+                    curr_rand_state = torch.randn((self.env.num_envs, 12), device=self.env.device)
+                    curr_adversary_action = torch.zeros((self.env.num_envs, ADVERSARY_ACTION_SPACE), device=self.env.device)
                     for i in reset_env_ids:
-                        rand_state = torch.randn(12)
+                        rand_state = torch.randn(12, device=self.env.device)
                         adversary_action = self.adversary.act(rand_state, timestep=timestep, timesteps=self.timesteps)[0]
                         self.env._env.env.adversary_action[i] = adversary_action
+                        curr_rand_state[i] = rand_state
+                        curr_adversary_action[i] = adversary_action
                 
                     if timestep > 0:
                         # TODO: unsure about assignment of states and next_states
                         self.adversary.record_transition(
-                            states=rand_state.repeat(self.env.num_envs, 1).to(self.env.device),
-                            actions=prev_adversary_action.repeat(self.env.num_envs, 1).to(self.env.device),
+                            states=prev_rand_state,
+                            actions=prev_adversary_action,
                             rewards=(-1 * rewards),
-                            next_states=rand_state.repeat(self.env.num_envs, 1).to(self.env.device),
+                            next_states=prev_rand_state,
                             terminated=terminated,
                             truncated=truncated,
                             infos=infos,
                             timestep=timestep,
                             timesteps=self.timesteps,
                         )
-                        prev_adversary_action = adversary_action
+                        prev_rand_state = curr_rand_state
+                        prev_adversary_action = curr_adversary_action
 
                 if timestep > 0:
                     self.adversary.post_interaction(timestep=timestep, timesteps=self.timesteps)
