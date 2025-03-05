@@ -123,7 +123,7 @@ class Trainer:
 
         # setup adversary
         num_inputs = 12 # arbitrary number of inputs, is a noise vector to condition on
-        num_outputs = self.cfg["num_clutter_objects"] * 3
+        num_outputs = (self.env._env.env.num_clutter_objects + 1) * 3 # clutter + main object
         adversary_shared_model = SharedModel(num_inputs, num_outputs, device=env.device)
         models = { # TODO: not sure if this is supposed to be shared
             "policy": adversary_shared_model,
