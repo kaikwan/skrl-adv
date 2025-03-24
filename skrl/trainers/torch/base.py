@@ -121,6 +121,10 @@ class Trainer:
         self.num_simultaneous_agents = 0
         self._setup_agents()
 
+        # set positioning strategy (have local copy for ease of access)
+        self.positioning_strategy = env._env.env.cfg.positioning_strategy
+        self.adversary_active = self.positioning_strategy == "pure_adversary"
+
         # setup adversary
         num_inputs = 12 # arbitrary number of inputs, is a noise vector to condition on
         num_outputs = (self.env._env.env.num_clutter_objects + 1) * 3 # clutter + main object
@@ -255,7 +259,18 @@ class Trainer:
         prev_adversary_action = torch.zeros((self.env.num_envs, ADVERSARY_ACTION_SPACE), device=self.env.device)
         for i in range(self.env.num_envs):
             rand_state = torch.randn(12, device=self.env.device)
-            adversary_action = self.adversary.act(rand_state, timestep=0, timesteps=self.timesteps)[0]
+
+            # Sample adversary action
+            if self.positioning_strategy == "domain_rand":
+                adversary_action = torch.rand(ADVERSARY_ACTION_SPACE, device=self.env.device) * 2 - 1
+            elif self.positioning_strategy == "domain_rand_restricted":
+                adversary_action = torch.rand(ADVERSARY_ACTION_SPACE, device=self.env.device) * 1.75 - 1
+            elif self.positioning_strategy == "pure_adversary":
+                adversary_action = self.adversary.act(rand_state, timestep=0, timesteps=self.timesteps)[0]
+            else:
+                raise ValueError(f"Invalid positioning strategy: {self.positioning_strategy}")
+
+            # Update tracking values and environment values
             self.env._env.env.adversary_action[i] = adversary_action
             prev_rand_state[i] = rand_state
             prev_adversary_action[i] = adversary_action
@@ -312,12 +327,23 @@ class Trainer:
                     curr_adversary_action = torch.zeros((self.env.num_envs, ADVERSARY_ACTION_SPACE), device=self.env.device)
                     for i in reset_env_ids:
                         rand_state = torch.randn(12, device=self.env.device)
-                        adversary_action = self.adversary.act(rand_state, timestep=timestep, timesteps=self.timesteps)[0]
+
+                        # Sample adversary action
+                        if self.positioning_strategy == "domain_rand":
+                            adversary_action = torch.rand(ADVERSARY_ACTION_SPACE, device=self.env.device) * 2 - 1
+                        elif self.positioning_strategy == "domain_rand_restricted":
+                            adversary_action = torch.rand(ADVERSARY_ACTION_SPACE, device=self.env.device) * 1.75 - 1
+                        elif self.positioning_strategy == "pure_adversary":
+                            adversary_action = self.adversary.act(rand_state, timestep=timestep, timesteps=self.timesteps)[0]
+                        else:
+                            raise ValueError(f"Invalid positioning strategy: {self.positioning_strategy}")
+
+                        # Update tracking values and environment values
                         self.env._env.env.adversary_action[i] = adversary_action
                         curr_rand_state[i] = rand_state
                         curr_adversary_action[i] = adversary_action
                 
-                    if timestep > 0:
+                    if timestep > 0 and self.adversary_active:
                         # TODO: unsure about assignment of states and next_states
                         self.adversary.record_transition(
                             states=prev_rand_state,
@@ -333,7 +359,7 @@ class Trainer:
                         prev_rand_state = curr_rand_state
                         prev_adversary_action = curr_adversary_action
 
-                if timestep > 0:
+                if timestep > 0 and self.adversary_active:
                     self.adversary.post_interaction(timestep=timestep, timesteps=self.timesteps)
                         
 
