@@ -253,22 +253,48 @@ class Trainer:
         assert self.num_simultaneous_agents == 1, "This method is not allowed for simultaneous agents"
         assert self.env.num_agents == 1, "This method is not allowed for multi-agents"
 
-        # reset env
+        # utility function to get an adversary action given the sampling strategy
         ADVERSARY_ACTION_SPACE = self.env._env.env.adversary_action.shape[-1]
+        SUCCESS_THRESHOLD = 0.55 # arbitrary threshold for success, based on reward modeling; 0.55/0.73 ~ 0.75
+        def get_adversary_action(
+            rand_state: torch.Tensor,
+            device: torch.device,
+            timestep=0,
+            rewards=None,
+            prev_action=None
+        ) -> torch.Tensor:
+            result_action = None
+            if self.positioning_strategy == "domain_rand":
+                # Randomly sample every action dimension from -1 to 1
+                result_action = torch.rand(ADVERSARY_ACTION_SPACE, device=device) * 2 - 1
+            elif self.positioning_strategy == "domain_rand_restricted":
+                # Randomly sample every action dimension from a subrange smaller than -1 to 1
+                result_action = torch.rand(ADVERSARY_ACTION_SPACE, device=device) * 0.5 - 0.1
+            elif self.positioning_strategy == "boosting_adversary":
+                # Boost samples that the agent performs poorly on
+                if timestep == 0:
+                    # Randomly sample as warmup
+                    result_action = torch.rand(ADVERSARY_ACTION_SPACE, device=device) * 2 - 1
+                else:
+                    # Perturb and re-learn from past action if agent performed poorly
+                    if rewards is not None and rewards < SUCCESS_THRESHOLD:
+                        result_action = prev_action + torch.rand(ADVERSARY_ACTION_SPACE, device=device) * 0.01
+                    else:
+                        result_action = torch.rand(ADVERSARY_ACTION_SPACE, device=device) * 2 - 1
+            elif self.positioning_strategy == "pure_adversary":
+                # Choose an action from a purely adversarial network
+                result_action = self.adversary.act(rand_state, timestep=timestep, timesteps=self.timesteps)[0]
+            else:
+                raise ValueError(f"Invalid positioning strategy: {self.positioning_strategy}")
+            return result_action
+
+        # reset env
         prev_rand_state = torch.randn((self.env.num_envs, 12), device=self.env.device)
         prev_adversary_action = torch.zeros((self.env.num_envs, ADVERSARY_ACTION_SPACE), device=self.env.device)
         for i in range(self.env.num_envs):
-            rand_state = torch.randn(12, device=self.env.device)
-
             # Sample adversary action
-            if self.positioning_strategy == "domain_rand":
-                adversary_action = torch.rand(ADVERSARY_ACTION_SPACE, device=self.env.device) * 2 - 1
-            elif self.positioning_strategy == "domain_rand_restricted":
-                adversary_action = torch.rand(ADVERSARY_ACTION_SPACE, device=self.env.device) * 1.75 - 1
-            elif self.positioning_strategy == "pure_adversary":
-                adversary_action = self.adversary.act(rand_state, timestep=0, timesteps=self.timesteps)[0]
-            else:
-                raise ValueError(f"Invalid positioning strategy: {self.positioning_strategy}")
+            rand_state = torch.randn(12, device=self.env.device)
+            adversary_action = get_adversary_action(rand_state, self.env.device, timestep=0)
 
             # Update tracking values and environment values
             self.env._env.env.adversary_action[i] = adversary_action
@@ -326,17 +352,15 @@ class Trainer:
                     curr_rand_state = torch.randn((self.env.num_envs, 12), device=self.env.device)
                     curr_adversary_action = torch.zeros((self.env.num_envs, ADVERSARY_ACTION_SPACE), device=self.env.device)
                     for i in reset_env_ids:
-                        rand_state = torch.randn(12, device=self.env.device)
-
                         # Sample adversary action
-                        if self.positioning_strategy == "domain_rand":
-                            adversary_action = torch.rand(ADVERSARY_ACTION_SPACE, device=self.env.device) * 2 - 1
-                        elif self.positioning_strategy == "domain_rand_restricted":
-                            adversary_action = torch.rand(ADVERSARY_ACTION_SPACE, device=self.env.device) * 1.75 - 1
-                        elif self.positioning_strategy == "pure_adversary":
-                            adversary_action = self.adversary.act(rand_state, timestep=timestep, timesteps=self.timesteps)[0]
-                        else:
-                            raise ValueError(f"Invalid positioning strategy: {self.positioning_strategy}")
+                        rand_state = torch.randn(12, device=self.env.device)
+                        adversary_action = get_adversary_action(
+                            rand_state,
+                            self.env.device,
+                            timestep=timestep,
+                            rewards=rewards[i],
+                            prev_action=prev_adversary_action[i]
+                        )
 
                         # Update tracking values and environment values
                         self.env._env.env.adversary_action[i] = adversary_action
