@@ -122,12 +122,12 @@ class Trainer:
         self._setup_agents()
 
         # set positioning strategy (have local copy for ease of access)
-        self.positioning_strategy = env._env.env.cfg.positioning_strategy
+        self.positioning_strategy = self._isaaclab_env().cfg.positioning_strategy
         self.adversary_active = self.positioning_strategy == "pure_adversary"
 
         # setup adversary
         num_inputs = 12 # arbitrary number of inputs, is a noise vector to condition on
-        num_outputs = (self.env._env.env.num_clutter_objects + 1) * 3 # clutter + main object
+        num_outputs = (self._isaaclab_env().num_clutter_objects + 1) * 3 # clutter + main object
         adversary_shared_model = SharedModel(num_inputs, num_outputs, device=env.device)
         models = { # TODO: not sure if this is supposed to be shared
             "policy": adversary_shared_model,
@@ -254,7 +254,7 @@ class Trainer:
         assert self.env.num_agents == 1, "This method is not allowed for multi-agents"
 
         # utility function to get an adversary action given the sampling strategy
-        ADVERSARY_ACTION_SPACE = self.env._env.env.adversary_action.shape[-1]
+        ADVERSARY_ACTION_SPACE = self._isaaclab_env().adversary_action.shape[-1]
         SUCCESS_THRESHOLD = 0.55 # arbitrary threshold for success, based on reward modeling; 0.55/0.73 ~ 0.75
         def get_adversary_action(
             rand_state: torch.Tensor,
@@ -297,7 +297,7 @@ class Trainer:
             adversary_action = get_adversary_action(rand_state, self.env.device, timestep=0)
 
             # Update tracking values and environment values
-            self.env._env.env.adversary_action[i] = adversary_action
+            self._isaaclab_env().adversary_action[i] = adversary_action
             prev_rand_state[i] = rand_state
             prev_adversary_action[i] = adversary_action
         states, infos = self.env.reset()
@@ -363,7 +363,7 @@ class Trainer:
                         )
 
                         # Update tracking values and environment values
-                        self.env._env.env.adversary_action[i] = adversary_action
+                        self._isaaclab_env().adversary_action[i] = adversary_action
                         curr_rand_state[i] = rand_state
                         curr_adversary_action[i] = adversary_action
                 
@@ -599,3 +599,14 @@ class Trainer:
             else:
                 states = next_states
                 shared_states = shared_next_states
+
+    def _isaaclab_env(self) -> Wrapper:
+        """Get the Isaac Lab environment through all the wrappers
+
+        :return: Environment
+        :rtype: AdversarialManagerBasedRLEnv
+        """
+        res = self.env._env.env
+        if hasattr(res, "env"):
+            res = res.env
+        return res
