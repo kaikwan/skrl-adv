@@ -5,11 +5,60 @@ import sys
 import tqdm
 
 import torch
+import torch.nn as nn
 
 from skrl import config, logger
 from skrl.agents.torch import Agent
 from skrl.envs.wrappers.torch import Wrapper
+from skrl.agents.torch.ppo import PPO
+from skrl.models.torch import Model, GaussianMixin, DeterministicMixin
+from skrl.memories.torch import RandomMemory
 
+
+# TODO: find better way to import this without hard coding it here
+# although it seems like this is hard coded at the top of the files for SKRL demos too
+# define the shared model
+class SharedModel(GaussianMixin, DeterministicMixin, Model):
+    def __init__(self, observation_space, action_space, device, clip_actions=False,
+                clip_log_std=True, min_log_std=-20, max_log_std=2, reduction="sum"):
+        Model.__init__(self, observation_space, action_space, device)
+        GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std, reduction, role="policy")
+        DeterministicMixin.__init__(self, clip_actions, role="value")
+
+        # shared layers/network
+        self.net = nn.Sequential(nn.Linear(self.num_observations, 32),
+                                 nn.ELU(),
+                                 nn.Linear(32, 32),
+                                 nn.ELU())
+
+        # separated layers ("policy")
+        self.mean_layer = nn.Linear(32, self.num_actions)
+        self.log_std_parameter = nn.Parameter(torch.zeros(self.num_actions))
+
+        # separated layer ("value")
+        self.value_layer = nn.Linear(32, 1)
+
+        # Shared value is 0
+        self._shared_output = None
+
+    # override the .act(...) method to disambiguate its call
+    def act(self, inputs, role):
+        if role == "policy":
+            return GaussianMixin.act(self, inputs, role)
+        elif role == "value":
+            return DeterministicMixin.act(self, inputs, role)
+
+    # forward the input to compute model output according to the specified role
+    def compute(self, inputs, role):
+        if role == "policy":
+            # save shared layers/network output to perform a single forward-pass
+            self._shared_output = self.net(inputs["states"])
+            return self.mean_layer(self._shared_output), self.log_std_parameter, {}
+        elif role == "value":
+            # use saved shared layers/network output to perform a single forward-pass, if it was saved
+            shared_output = self.net(inputs["states"]) if self._shared_output is None else self._shared_output
+            self._shared_output = None  # reset saved shared output to prevent the use of erroneous data in subsequent steps
+            return self.value_layer(shared_output), {}
 
 def generate_equally_spaced_scopes(num_envs: int, num_simultaneous_agents: int) -> List[int]:
     """Generate a list of equally spaced scopes for the agents
@@ -71,6 +120,32 @@ class Trainer:
         # setup agents
         self.num_simultaneous_agents = 0
         self._setup_agents()
+
+        # set positioning strategy (have local copy for ease of access)
+        self.positioning_strategy = self._isaaclab_env().cfg.positioning_strategy
+        self.adversary_active = self.positioning_strategy == "pure_adversary"
+
+        # setup adversary
+        num_inputs = 12 # arbitrary number of inputs, is a noise vector to condition on
+        num_outputs = (self._isaaclab_env().num_clutter_objects + 1) * 3 # clutter + main object
+        adversary_shared_model = SharedModel(num_inputs, num_outputs, device=env.device)
+        models = { # TODO: not sure if this is supposed to be shared
+            "policy": adversary_shared_model,
+            "value": adversary_shared_model
+        }
+        adversary_cfg = {
+            "rollouts": 1
+        }
+
+        self.adversary = PPO(
+            models=models,
+            device=env.device,
+            observation_space=num_inputs,
+            action_space=num_outputs,
+            memory=RandomMemory(num_envs=self.env.num_envs, memory_size=adversary_cfg["rollouts"], device=env.device),
+            cfg=adversary_cfg
+        )
+        self.adversary.init()
 
         # register environment closing if configured
         if self.close_environment_at_exit:
@@ -178,7 +253,55 @@ class Trainer:
         assert self.num_simultaneous_agents == 1, "This method is not allowed for simultaneous agents"
         assert self.env.num_agents == 1, "This method is not allowed for multi-agents"
 
+        # utility function to get an adversary action given the sampling strategy
+        ADVERSARY_ACTION_SPACE = self._isaaclab_env().adversary_action.shape[-1]
+        SUCCESS_THRESHOLD = 0.55 # arbitrary threshold for success, based on reward modeling; 0.55/0.73 ~ 0.75
+        def get_adversary_action(
+            rand_state: torch.Tensor,
+            device: torch.device,
+            timestep=0,
+            rewards=None,
+            prev_action=None
+        ) -> torch.Tensor:
+            result_action = None
+            if self.positioning_strategy == "domain_rand":
+                # Randomly sample every action dimension from -1 to 1
+                result_action = torch.rand(ADVERSARY_ACTION_SPACE, device=device) * 2 - 1
+            elif self.positioning_strategy == "domain_rand_restricted":
+                # Randomly sample every action dimension from a subrange smaller than -1 to 1
+                result_action = torch.rand(ADVERSARY_ACTION_SPACE, device=device)
+                result_action[0] = result_action[0] * 2 - 1 # x direction is stretched
+                result_action[1] = result_action[1] # y direction is restricted
+            elif self.positioning_strategy == "boosting_adversary":
+                # Boost samples that the agent performs poorly on
+                if timestep == 0:
+                    # Randomly sample as warmup
+                    result_action = torch.rand(ADVERSARY_ACTION_SPACE, device=device) * 2 - 1
+                else:
+                    # Perturb and re-learn from past action if agent performed poorly
+                    if rewards is not None and rewards < SUCCESS_THRESHOLD:
+                        result_action = prev_action + torch.rand(ADVERSARY_ACTION_SPACE, device=device) * 0.01
+                    else:
+                        result_action = torch.rand(ADVERSARY_ACTION_SPACE, device=device) * 2 - 1
+            elif self.positioning_strategy == "pure_adversary":
+                # Choose an action from a purely adversarial network
+                result_action = self.adversary.act(rand_state, timestep=timestep, timesteps=self.timesteps)[0]
+            else:
+                raise ValueError(f"Invalid positioning strategy: {self.positioning_strategy}")
+            return result_action
+
         # reset env
+        prev_rand_state = torch.randn((self.env.num_envs, 12), device=self.env.device)
+        prev_adversary_action = torch.zeros((self.env.num_envs, ADVERSARY_ACTION_SPACE), device=self.env.device)
+        for i in range(self.env.num_envs):
+            # Sample adversary action
+            rand_state = torch.randn(12, device=self.env.device)
+            adversary_action = get_adversary_action(rand_state, self.env.device, timestep=0)
+
+            # Update tracking values and environment values
+            self._isaaclab_env().adversary_action[i] = adversary_action
+            prev_rand_state[i] = rand_state
+            prev_adversary_action[i] = adversary_action
         states, infos = self.env.reset()
 
         for timestep in tqdm.tqdm(
@@ -187,6 +310,7 @@ class Trainer:
 
             # pre-interaction
             self.agents.pre_interaction(timestep=timestep, timesteps=self.timesteps)
+            self.adversary.pre_interaction(timestep=timestep, timesteps=self.timesteps)
 
             with torch.no_grad():
                 # compute actions
@@ -222,14 +346,48 @@ class Trainer:
             self.agents.post_interaction(timestep=timestep, timesteps=self.timesteps)
 
             # reset environments
-            if self.env.num_envs > 1:
-                states = next_states
-            else:
-                if terminated.any() or truncated.any():
-                    with torch.no_grad():
-                        states, infos = self.env.reset()
-                else:
-                    states = next_states
+            states = next_states
+            if timestep == 0 or terminated.any() or truncated.any():
+                with torch.no_grad():
+                    # loop through all envs that need to be reset and update their adversary action
+                    reset_env_ids = self.env.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+                    curr_rand_state = torch.randn((self.env.num_envs, 12), device=self.env.device)
+                    curr_adversary_action = torch.zeros((self.env.num_envs, ADVERSARY_ACTION_SPACE), device=self.env.device)
+                    for i in reset_env_ids:
+                        # Sample adversary action
+                        rand_state = torch.randn(12, device=self.env.device)
+                        adversary_action = get_adversary_action(
+                            rand_state,
+                            self.env.device,
+                            timestep=timestep,
+                            rewards=rewards[i],
+                            prev_action=prev_adversary_action[i]
+                        )
+
+                        # Update tracking values and environment values
+                        self._isaaclab_env().adversary_action[i] = adversary_action
+                        curr_rand_state[i] = rand_state
+                        curr_adversary_action[i] = adversary_action
+                
+                    if timestep > 0 and self.adversary_active:
+                        # TODO: unsure about assignment of states and next_states
+                        self.adversary.record_transition(
+                            states=prev_rand_state,
+                            actions=prev_adversary_action,
+                            rewards=(-1 * rewards),
+                            next_states=prev_rand_state,
+                            terminated=terminated,
+                            truncated=truncated,
+                            infos=infos,
+                            timestep=timestep,
+                            timesteps=self.timesteps,
+                        )
+                        prev_rand_state = curr_rand_state
+                        prev_adversary_action = curr_adversary_action
+
+                if timestep > 0 and self.adversary_active:
+                    self.adversary.post_interaction(timestep=timestep, timesteps=self.timesteps)
+                        
 
     def single_agent_eval(self) -> None:
         """Evaluate agent
@@ -443,3 +601,14 @@ class Trainer:
             else:
                 states = next_states
                 shared_states = shared_next_states
+
+    def _isaaclab_env(self) -> Wrapper:
+        """Get the Isaac Lab environment through all the wrappers
+
+        :return: Environment
+        :rtype: AdversarialManagerBasedRLEnv
+        """
+        res = self.env._env.env
+        if hasattr(res, "env"):
+            res = res.env
+        return res

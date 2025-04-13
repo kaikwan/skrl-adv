@@ -233,6 +233,8 @@ class PPO(Agent):
         :return: Actions
         :rtype: torch.Tensor
         """
+        states = states.to(self.device)
+        
         # sample random actions
         # TODO, check for stochasticity
         if timestep < self._random_timesteps:
@@ -407,9 +409,12 @@ class PPO(Agent):
         # compute returns and advantages
         with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
             self.value.train(False)
-            last_values, _, _ = self.value.act(
-                {"states": self._state_preprocessor(self._current_next_states.float())}, role="value"
-            )
+            if self._current_next_states == None:
+                last_values = 0
+            else:
+                last_values, _, _ = self.value.act(
+                    {"states": self._state_preprocessor(self._current_next_states.float())}, role="value"
+                )
             self.value.train(True)
             last_values = self._value_preprocessor(last_values, inverse=True)
 
