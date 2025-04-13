@@ -269,7 +269,9 @@ class Trainer:
                 result_action = torch.rand(ADVERSARY_ACTION_SPACE, device=device) * 2 - 1
             elif self.positioning_strategy == "domain_rand_restricted":
                 # Randomly sample every action dimension from a subrange smaller than -1 to 1
-                result_action = torch.rand(ADVERSARY_ACTION_SPACE, device=device) * 0.5 - 0.1
+                result_action = torch.rand(ADVERSARY_ACTION_SPACE, device=device)
+                result_action[0] = result_action[0] * 2 - 1 # x direction is stretched
+                result_action[1] = result_action[1] # y direction is restricted
             elif self.positioning_strategy == "boosting_adversary":
                 # Boost samples that the agent performs poorly on
                 if timestep == 0:
