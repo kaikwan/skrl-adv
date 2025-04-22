@@ -7,6 +7,9 @@ import tqdm
 import torch
 import torch.nn as nn
 
+import numpy as np
+import os
+
 from skrl import config, logger
 from skrl.agents.torch import Agent
 from skrl.envs.wrappers.torch import Wrapper
@@ -124,11 +127,12 @@ class Trainer:
         # set positioning strategy (have local copy for ease of access)
         self.positioning_strategy = self._isaaclab_env().cfg.positioning_strategy
         self.adversary_active = self.positioning_strategy == "pure_adversary"
+        self.log_adversary = "adversary" in self.positioning_strategy
 
         # setup adversary
-        num_inputs = 12 # arbitrary number of inputs, is a noise vector to condition on
+        self.adversary_num_inputs = 4 # arbitrary number of inputs, is a noise vector to condition on
         num_outputs = (self._isaaclab_env().num_clutter_objects + 1) * 3 # clutter + main object
-        adversary_shared_model = SharedModel(num_inputs, num_outputs, device=env.device)
+        adversary_shared_model = SharedModel(self.adversary_num_inputs, num_outputs, device=env.device)
         models = { # TODO: not sure if this is supposed to be shared
             "policy": adversary_shared_model,
             "value": adversary_shared_model
@@ -140,7 +144,7 @@ class Trainer:
         self.adversary = PPO(
             models=models,
             device=env.device,
-            observation_space=num_inputs,
+            observation_space=self.adversary_num_inputs,
             action_space=num_outputs,
             memory=RandomMemory(num_envs=self.env.num_envs, memory_size=adversary_cfg["rollouts"], device=env.device),
             cfg=adversary_cfg
@@ -291,11 +295,11 @@ class Trainer:
             return result_action
 
         # reset env
-        prev_rand_state = torch.randn((self.env.num_envs, 12), device=self.env.device)
+        prev_rand_state = torch.randn((self.env.num_envs, self.adversary_num_inputs), device=self.env.device)
         prev_adversary_action = torch.zeros((self.env.num_envs, ADVERSARY_ACTION_SPACE), device=self.env.device)
         for i in range(self.env.num_envs):
             # Sample adversary action
-            rand_state = torch.randn(12, device=self.env.device)
+            rand_state = torch.randn(self.adversary_num_inputs, device=self.env.device)
             adversary_action = get_adversary_action(rand_state, self.env.device, timestep=0)
 
             # Update tracking values and environment values
@@ -304,6 +308,7 @@ class Trainer:
             prev_adversary_action[i] = adversary_action
         states, infos = self.env.reset()
 
+        adversary_log = []
         for timestep in tqdm.tqdm(
             range(self.initial_timestep, self.timesteps), disable=self.disable_progressbar, file=sys.stdout
         ):
@@ -341,21 +346,23 @@ class Trainer:
                     for k, v in infos[self.environment_info].items():
                         if isinstance(v, torch.Tensor) and v.numel() == 1:
                             self.agents.track_data(f"Info / {k}", v.item())
-
-            # post-interaction
+            
+            # agents post interaction
             self.agents.post_interaction(timestep=timestep, timesteps=self.timesteps)
 
             # reset environments
             states = next_states
-            if timestep == 0 or terminated.any() or truncated.any():
+            if timestep == 0 or terminated.all() or truncated.all(): # important to use .all() instead of .any()
                 with torch.no_grad():
-                    # loop through all envs that need to be reset and update their adversary action
+                    # reset_env_ids is currently not used but it should be equivalent to range(self.env.num_envs)
                     reset_env_ids = self.env.reset_buf.nonzero(as_tuple=False).squeeze(-1)
-                    curr_rand_state = torch.randn((self.env.num_envs, 12), device=self.env.device)
+
+                    # loop through all envs that need to be reset and update their adversary action
+                    curr_rand_state = torch.randn((self.env.num_envs, self.adversary_num_inputs), device=self.env.device)
                     curr_adversary_action = torch.zeros((self.env.num_envs, ADVERSARY_ACTION_SPACE), device=self.env.device)
-                    for i in reset_env_ids:
+                    for i in range(self.env.num_envs):
                         # Sample adversary action
-                        rand_state = torch.randn(12, device=self.env.device)
+                        rand_state = torch.randn(self.adversary_num_inputs, device=self.env.device)
                         adversary_action = get_adversary_action(
                             rand_state,
                             self.env.device,
@@ -368,13 +375,27 @@ class Trainer:
                         self._isaaclab_env().adversary_action[i] = adversary_action
                         curr_rand_state[i] = rand_state
                         curr_adversary_action[i] = adversary_action
+                    
+                    # update adversary log
+                    if self.log_adversary:
+                        adversary_log.append(curr_adversary_action.cpu().numpy())
                 
+                    # compute reward
+                    # reward is negative of agent reward
+                    # penalizes for action values outside [-1,1] range
+                    range_penalty = torch.sum(torch.maximum(
+                        (prev_adversary_action ** 2) - 1,
+                        torch.zeros(prev_adversary_action.shape, device=self.env.device)
+                    ), dim=1, keepdim=True)
+                    adversary_rewards = (-1 * rewards) - range_penalty
+
+                    # update adversary
                     if timestep > 0 and self.adversary_active:
-                        # TODO: unsure about assignment of states and next_states
+                        # unsure about assignment of states and next_states
                         self.adversary.record_transition(
                             states=prev_rand_state,
                             actions=prev_adversary_action,
-                            rewards=(-1 * rewards),
+                            rewards=adversary_rewards,
                             next_states=prev_rand_state,
                             terminated=terminated,
                             truncated=truncated,
@@ -384,10 +405,21 @@ class Trainer:
                         )
                         prev_rand_state = curr_rand_state
                         prev_adversary_action = curr_adversary_action
-
+                
+                # adversary post interaction
                 if timestep > 0 and self.adversary_active:
                     self.adversary.post_interaction(timestep=timestep, timesteps=self.timesteps)
-                        
+
+        # dump adversary logs
+        if self.log_adversary:
+            RESULT_DIR = os.path.join(self.agents.experiment_dir, "adversary_logs")
+            os.makedirs(RESULT_DIR, exist_ok=True)
+
+            # dump adversary log to .npy file
+            adversary_log = np.array(adversary_log)
+            np.save(os.path.join(RESULT_DIR, "adversary_action_log.npy"), adversary_log)
+            logger.info("Adversary action log dumped to file")
+
 
     def single_agent_eval(self) -> None:
         """Evaluate agent
