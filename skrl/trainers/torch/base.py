@@ -257,9 +257,13 @@ class Trainer:
         assert self.num_simultaneous_agents == 1, "This method is not allowed for simultaneous agents"
         assert self.env.num_agents == 1, "This method is not allowed for multi-agents"
 
-        # utility function to get an adversary action given the sampling strategy
+        # useful constants
+        NUM_ENVS = self.env.num_envs
         ADVERSARY_ACTION_SPACE = self._isaaclab_env().adversary_action.shape[-1]
         SUCCESS_THRESHOLD = 0.55 # arbitrary threshold for success, based on reward modeling; 0.55/0.73 ~ 0.75
+        MAX_EPISODE_LENGTH = self._isaaclab_env().max_episode_length
+
+        # utility function to get an adversary action given the sampling strategy
         def get_adversary_action(
             rand_state: torch.Tensor,
             device: torch.device,
@@ -270,15 +274,15 @@ class Trainer:
             result_action = None
             if self.positioning_strategy == "domain_rand":
                 # Randomly sample every action dimension from -1 to 1
-                result_action = torch.rand((self.env.num_envs, ADVERSARY_ACTION_SPACE), device=device) * 2 - 1
+                result_action = torch.rand((NUM_ENVS, ADVERSARY_ACTION_SPACE), device=device) * 2 - 1
             elif self.positioning_strategy == "domain_rand_restricted":
                 # Randomly sample every action dimension from a subrange smaller than -1 to 1
-                result_action = torch.rand((self.env.num_envs, ADVERSARY_ACTION_SPACE), device=device)
+                result_action = torch.rand((NUM_ENVS, ADVERSARY_ACTION_SPACE), device=device)
                 result_action[:,0] = result_action[:,0] * 2 - 1 # x direction is stretched
                 result_action[:,1] = result_action[:,1] # y direction is unchaged, [0,1]
             elif self.positioning_strategy == "boosting_adversary":
                 # Boost samples that the agent performs poorly on
-                result_action = torch.rand((self.env.num_envs, ADVERSARY_ACTION_SPACE), device=device) * 2 - 1
+                result_action = torch.rand((NUM_ENVS, ADVERSARY_ACTION_SPACE), device=device) * 2 - 1
                 if timestep > 0:
                     # Perturb and re-learn from past action if agent performed poorly
                     if rewards is not None and prev_action is not None:
@@ -286,17 +290,25 @@ class Trainer:
                         if torch.sum(mask).item() > 0:
                             result_action[mask] = prev_action[mask] + result_action[mask] * 0.05
             elif self.positioning_strategy == "pure_adversary":
+                # Pre interaction for the adversary
+                self.adversary.pre_interaction(
+                    timestep=((timestep+1) // MAX_EPISODE_LENGTH),
+                    timesteps=(self.timesteps // MAX_EPISODE_LENGTH)
+                )
+
                 # Choose an action from a purely adversarial network
-                result_action = self.adversary.act(rand_state, timestep=timestep, timesteps=self.timesteps)[0]
+                result_action = self.adversary.act(
+                    rand_state,
+                    timestep=((timestep+1) // MAX_EPISODE_LENGTH),
+                    timesteps=(self.timesteps // MAX_EPISODE_LENGTH)
+                )[0]
             else:
                 raise ValueError(f"Invalid positioning strategy: {self.positioning_strategy}")
             return result_action
 
         # reset env
-        rand_state = torch.randn((self.env.num_envs, self.adversary_num_inputs), device=self.env.device)
+        rand_state = torch.randn((NUM_ENVS, self.adversary_num_inputs), device=self.env.device)
         adversary_action = get_adversary_action(rand_state, self.env.device, timestep=0)
-        prev_rand_state = rand_state.clone()
-        prev_adversary_action = adversary_action.clone()
 
         self._isaaclab_env().adversary_action = adversary_action
         states, infos = self.env.reset()
@@ -308,7 +320,6 @@ class Trainer:
 
             # pre-interaction
             self.agents.pre_interaction(timestep=timestep, timesteps=self.timesteps)
-            self.adversary.pre_interaction(timestep=timestep, timesteps=self.timesteps)
 
             with torch.no_grad():
                 # compute actions
@@ -344,56 +355,61 @@ class Trainer:
             self.agents.post_interaction(timestep=timestep, timesteps=self.timesteps)
 
             # reset environments
+            # note that the environment is already reset for timestep 0 before the loop starts
             states = next_states
-            if timestep == 0 or terminated.all() or truncated.all(): # important to use .all() instead of .any()
+            if timestep > 0 and (terminated.all() or truncated.all()): # important to use .all() instead of .any()
+                # update adversary
                 with torch.no_grad():
-                    # reset_env_ids is currently not used but it should be equivalent to range(self.env.num_envs)
+                    # reset_env_ids is currently not used but it should be equivalent to range(NUM_ENVS)
                     reset_env_ids = self.env.reset_buf.nonzero(as_tuple=False).squeeze(-1)
 
+                    # do not update if adversary does not need an update
+                    if self.adversary_active:
+                        # compute reward
+                        # reward is negative of agent reward
+                        # penalizes for action values outside [-1,1] range
+                        range_penalty = torch.sum(torch.maximum(
+                            (adversary_action ** 2) - 1,
+                            torch.zeros(adversary_action.shape, device=self.env.device)
+                        ), dim=1, keepdim=True)
+                        adversary_rewards = (-1 * rewards) - range_penalty
+
+                        # unsure about assignment of states and next_states
+                        self.adversary.record_transition(
+                            states=rand_state,
+                            actions=adversary_action,
+                            rewards=adversary_rewards,
+                            next_states=rand_state,
+                            terminated=terminated,
+                            truncated=truncated,
+                            infos=infos,
+                            timestep=(timestep // MAX_EPISODE_LENGTH),
+                            timesteps=(self.timesteps // MAX_EPISODE_LENGTH),
+                        )
+            
+                # adversary post interaction
+                if self.adversary_active:
+                    self.adversary.post_interaction(
+                        timestep=(timestep // MAX_EPISODE_LENGTH),
+                        timesteps=(self.timesteps // MAX_EPISODE_LENGTH)
+                    )
+
+                # take next action from adversary
+                with torch.no_grad():
                     # loop through all envs that need to be reset and update their adversary action
-                    curr_rand_state = torch.randn((self.env.num_envs, self.adversary_num_inputs), device=self.env.device)
-                    curr_adversary_action = get_adversary_action(
+                    rand_state = torch.randn((NUM_ENVS, self.adversary_num_inputs), device=self.env.device)
+                    adversary_action = get_adversary_action(
                         rand_state,
                         self.env.device,
                         timestep=timestep,
                         rewards=rewards,
-                        prev_action=prev_adversary_action
+                        prev_action=adversary_action
                     )
-                    self._isaaclab_env().adversary_action = curr_adversary_action
+                    self._isaaclab_env().adversary_action = adversary_action
                     
                     # update adversary log
                     if self.log_adversary:
-                        adversary_log.append(curr_adversary_action.cpu().numpy())
-                
-                    # compute reward
-                    # reward is negative of agent reward
-                    # penalizes for action values outside [-1,1] range
-                    range_penalty = torch.sum(torch.maximum(
-                        (prev_adversary_action ** 2) - 1,
-                        torch.zeros(prev_adversary_action.shape, device=self.env.device)
-                    ), dim=1, keepdim=True)
-                    adversary_rewards = (-1 * rewards) - range_penalty
-
-                    # update adversary
-                    if timestep > 0 and self.adversary_active:
-                        # unsure about assignment of states and next_states
-                        self.adversary.record_transition(
-                            states=prev_rand_state,
-                            actions=prev_adversary_action,
-                            rewards=adversary_rewards,
-                            next_states=prev_rand_state,
-                            terminated=terminated,
-                            truncated=truncated,
-                            infos=infos,
-                            timestep=timestep,
-                            timesteps=self.timesteps,
-                        )
-                        prev_rand_state = curr_rand_state.clone()
-                        prev_adversary_action = curr_adversary_action.clone()
-                
-                # adversary post interaction
-                if timestep > 0 and self.adversary_active:
-                    self.adversary.post_interaction(timestep=timestep, timesteps=self.timesteps)
+                        adversary_log.append(adversary_action.cpu().numpy())
 
         # dump adversary logs
         if self.log_adversary:
