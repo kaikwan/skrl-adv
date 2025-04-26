@@ -260,7 +260,7 @@ class Trainer:
         # useful constants
         NUM_ENVS = self.env.num_envs
         ADVERSARY_ACTION_SPACE = self._isaaclab_env().adversary_action.shape[-1]
-        SUCCESS_THRESHOLD = 0.55 # arbitrary threshold for success, based on reward modeling; 0.55/0.73 ~ 0.75
+        SUCCESS_THRESHOLD = 0.55 # arbitrary threshold for success, does not work for sum of rewards
         MAX_EPISODE_LENGTH = self._isaaclab_env().max_episode_length
 
         # utility function to get an adversary action given the sampling strategy
@@ -297,11 +297,12 @@ class Trainer:
                 )
 
                 # Choose an action from a purely adversarial network
-                result_action = self.adversary.act(
-                    rand_state,
-                    timestep=((timestep+1) // MAX_EPISODE_LENGTH),
-                    timesteps=(self.timesteps // MAX_EPISODE_LENGTH)
-                )[0]
+                with torch.no_grad():
+                    result_action = self.adversary.act(
+                        rand_state,
+                        timestep=((timestep+1) // MAX_EPISODE_LENGTH),
+                        timesteps=(self.timesteps // MAX_EPISODE_LENGTH)
+                    )[0]
             else:
                 raise ValueError(f"Invalid positioning strategy: {self.positioning_strategy}")
             return result_action
@@ -309,11 +310,13 @@ class Trainer:
         # reset env
         rand_state = torch.randn((NUM_ENVS, self.adversary_num_inputs), device=self.env.device)
         adversary_action = get_adversary_action(rand_state, self.env.device, timestep=0)
+        episode_rewards = torch.zeros((NUM_ENVS, 1), device=self.env.device)
 
         self._isaaclab_env().adversary_action = adversary_action
         states, infos = self.env.reset()
 
-        adversary_log = []
+        adversary_action_log = []
+        adversary_reward_log = []
         for timestep in tqdm.tqdm(
             range(self.initial_timestep, self.timesteps), disable=self.disable_progressbar, file=sys.stdout
         ):
@@ -327,6 +330,7 @@ class Trainer:
 
                 # step the environments
                 next_states, rewards, terminated, truncated, infos = self.env.step(actions)
+                episode_rewards += rewards
 
                 # render scene
                 if not self.headless:
@@ -358,13 +362,12 @@ class Trainer:
             # note that the environment is already reset for timestep 0 before the loop starts
             states = next_states
             if timestep > 0 and (terminated.all() or truncated.all()): # important to use .all() instead of .any()
-                # update adversary
-                with torch.no_grad():
-                    # reset_env_ids is currently not used but it should be equivalent to range(NUM_ENVS)
-                    reset_env_ids = self.env.reset_buf.nonzero(as_tuple=False).squeeze(-1)
-
-                    # do not update if adversary does not need an update
-                    if self.adversary_active:
+                # reset_env_ids is currently not used but it should be equivalent to range(NUM_ENVS)
+                reset_env_ids = self.env.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+                
+                if self.adversary_active:
+                    # update adversary
+                    with torch.no_grad():                    
                         # compute reward
                         # reward is negative of agent reward
                         # penalizes for action values outside [-1,1] range
@@ -372,7 +375,8 @@ class Trainer:
                             (adversary_action ** 2) - 1,
                             torch.zeros(adversary_action.shape, device=self.env.device)
                         ), dim=1, keepdim=True)
-                        adversary_rewards = (-1 * rewards) - range_penalty
+                        adversary_rewards = (-1 * episode_rewards) - range_penalty
+                        adversary_reward_log.append(adversary_rewards.flatten().cpu().numpy())
 
                         # unsure about assignment of states and next_states
                         self.adversary.record_transition(
@@ -380,36 +384,36 @@ class Trainer:
                             actions=adversary_action,
                             rewards=adversary_rewards,
                             next_states=rand_state,
-                            terminated=terminated,
-                            truncated=truncated,
-                            infos=infos,
+                            terminated=torch.ones(terminated.shape, device=self.env.device),
+                            truncated=torch.ones(truncated.shape, device=self.env.device),
+                            infos={},
                             timestep=(timestep // MAX_EPISODE_LENGTH),
                             timesteps=(self.timesteps // MAX_EPISODE_LENGTH),
                         )
-            
-                # adversary post interaction
-                if self.adversary_active:
+
+                    # adversary post interaction
                     self.adversary.post_interaction(
                         timestep=(timestep // MAX_EPISODE_LENGTH),
                         timesteps=(self.timesteps // MAX_EPISODE_LENGTH)
                     )
 
                 # take next action from adversary
-                with torch.no_grad():
-                    # loop through all envs that need to be reset and update their adversary action
-                    rand_state = torch.randn((NUM_ENVS, self.adversary_num_inputs), device=self.env.device)
-                    adversary_action = get_adversary_action(
-                        rand_state,
-                        self.env.device,
-                        timestep=timestep,
-                        rewards=rewards,
-                        prev_action=adversary_action
-                    )
-                    self._isaaclab_env().adversary_action = adversary_action
-                    
-                    # update adversary log
-                    if self.log_adversary:
-                        adversary_log.append(adversary_action.cpu().numpy())
+                rand_state = torch.randn((NUM_ENVS, self.adversary_num_inputs), device=self.env.device)
+                adversary_action = get_adversary_action(
+                    rand_state,
+                    self.env.device,
+                    timestep=timestep,
+                    rewards=rewards,
+                    prev_action=adversary_action
+                )
+                self._isaaclab_env().adversary_action = adversary_action
+                
+                # update adversary log
+                if self.log_adversary:
+                    adversary_action_log.append(adversary_action.cpu().numpy())
+
+                # reset episode rewards
+                episode_rewards = torch.zeros((NUM_ENVS, 1), device=self.env.device)
 
         # dump adversary logs
         if self.log_adversary:
@@ -417,9 +421,14 @@ class Trainer:
             os.makedirs(RESULT_DIR, exist_ok=True)
 
             # dump adversary log to .npy file
-            adversary_log = np.array(adversary_log)
-            np.save(os.path.join(RESULT_DIR, "adversary_action_log.npy"), adversary_log)
+            adversary_action_log = np.array(adversary_action_log)
+            np.save(os.path.join(RESULT_DIR, "adversary_action_log.npy"), adversary_action_log)
             logger.info("Adversary action log dumped to file")
+
+            # dump adversary reward log to .npy file
+            adversary_reward_log = np.array(adversary_reward_log)
+            np.save(os.path.join(RESULT_DIR, "adversary_reward_log.npy"), adversary_reward_log)
+            logger.info("Adversary reward log dumped to file")
 
 
     def single_agent_eval(self) -> None:
