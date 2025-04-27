@@ -150,6 +150,7 @@ class Trainer:
             cfg=adversary_cfg
         )
         self.adversary.init()
+        self.adversary._learning_starts = 5 # explore a bit more before learning
 
         # register environment closing if configured
         if self.close_environment_at_exit:
@@ -320,6 +321,20 @@ class Trainer:
         for timestep in tqdm.tqdm(
             range(self.initial_timestep, self.timesteps), disable=self.disable_progressbar, file=sys.stdout
         ):
+            # take next action from adversary if at the end of an episode
+            if timestep % MAX_EPISODE_LENGTH == MAX_EPISODE_LENGTH - 1:
+                rand_state = torch.randn((NUM_ENVS, self.adversary_num_inputs), device=self.env.device)
+                adversary_action = get_adversary_action(
+                    rand_state,
+                    self.env.device,
+                    timestep=timestep,
+                    rewards=rewards,
+                    prev_action=adversary_action
+                )
+                self._isaaclab_env().adversary_action = adversary_action
+
+                # reset episode rewards
+                episode_rewards = torch.zeros((NUM_ENVS, 1), device=self.env.device)
 
             # pre-interaction
             self.agents.pre_interaction(timestep=timestep, timesteps=self.timesteps)
@@ -330,7 +345,11 @@ class Trainer:
 
                 # step the environments
                 next_states, rewards, terminated, truncated, infos = self.env.step(actions)
-                episode_rewards += rewards
+                
+                # update episode rewards
+                # skip reward from last episode
+                if timestep % MAX_EPISODE_LENGTH != MAX_EPISODE_LENGTH - 1:
+                    episode_rewards += rewards
 
                 # render scene
                 if not self.headless:
@@ -358,10 +377,11 @@ class Trainer:
             # agents post interaction
             self.agents.post_interaction(timestep=timestep, timesteps=self.timesteps)
 
-            # reset environments
-            # note that the environment is already reset for timestep 0 before the loop starts
+            # update adversary at end of episode
+            # called at second last episode step to allow for adversary action to be taken at the last step
+            # due to software engineering limitations, we skip the last step of the episode, which is negligible
             states = next_states
-            if timestep > 0 and (terminated.all() or truncated.all()): # important to use .all() instead of .any()
+            if timestep % MAX_EPISODE_LENGTH == MAX_EPISODE_LENGTH - 2:
                 # reset_env_ids is currently not used but it should be equivalent to range(NUM_ENVS)
                 reset_env_ids = self.env.reset_buf.nonzero(as_tuple=False).squeeze(-1)
                 
@@ -376,7 +396,6 @@ class Trainer:
                             torch.zeros(adversary_action.shape, device=self.env.device)
                         ), dim=1, keepdim=True)
                         adversary_rewards = (-1 * episode_rewards) - range_penalty
-                        adversary_reward_log.append(adversary_rewards.flatten().cpu().numpy())
 
                         # unsure about assignment of states and next_states
                         self.adversary.record_transition(
@@ -391,29 +410,16 @@ class Trainer:
                             timesteps=(self.timesteps // MAX_EPISODE_LENGTH),
                         )
 
+                        # log adversary data as necessary
+                        if self.log_adversary:
+                            adversary_action_log.append(adversary_action.cpu().numpy())
+                            adversary_reward_log.append(adversary_rewards.flatten().cpu().numpy())
+
                     # adversary post interaction
                     self.adversary.post_interaction(
                         timestep=(timestep // MAX_EPISODE_LENGTH),
                         timesteps=(self.timesteps // MAX_EPISODE_LENGTH)
                     )
-
-                # take next action from adversary
-                rand_state = torch.randn((NUM_ENVS, self.adversary_num_inputs), device=self.env.device)
-                adversary_action = get_adversary_action(
-                    rand_state,
-                    self.env.device,
-                    timestep=timestep,
-                    rewards=rewards,
-                    prev_action=adversary_action
-                )
-                self._isaaclab_env().adversary_action = adversary_action
-                
-                # update adversary log
-                if self.log_adversary:
-                    adversary_action_log.append(adversary_action.cpu().numpy())
-
-                # reset episode rewards
-                episode_rewards = torch.zeros((NUM_ENVS, 1), device=self.env.device)
 
         # dump adversary logs
         if self.log_adversary:
